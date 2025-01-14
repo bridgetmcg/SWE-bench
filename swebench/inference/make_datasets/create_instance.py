@@ -218,7 +218,7 @@ def prompt_style_2_edits_only(instance):
 def prompt_style_3(instance):
     premise = "You will be provided with a partial code base and an issue statement explaining a problem to resolve."
     readmes_text = make_code_text(instance["readmes"])
-    code_text = make_code_text(instance["file_contents"])
+    code_text = make_code_text(instance["function_contents"])
     example_explanation = (
         f"Here is an example of a patch file. It consists of changes to the code base. "
         + f"It specifies the file names, the line numbers of each change, and the removed and added lines. "
@@ -251,6 +251,35 @@ def prompt_style_3(instance):
     ]
     final_text = "\n".join(final_text)
     return final_text
+
+def prompt_style_4(instance):
+    premise = "You will be provided with a partial code base and an issue statement explaining a problem to resolve."
+    readmes_text = ""
+    code_text = make_code_text(instance["file_contents"])
+    instructions = (
+        f"I need you to solve this issue by generating a single patch file that I can apply "
+        + f"directly to this repository using git apply. Please respond with a single patch "
+        + f"file in the following format."
+    )
+    problem_statement = instance["problem_statement"]
+    final_text = [
+        premise,
+        "<issue>",
+        problem_statement,
+        "</issue>",
+        "<code>",
+        readmes_text,
+        code_text,
+        "</code>",
+        instructions,
+        "<patch>",
+        PATCH_EXAMPLE,
+        "</patch>",
+    ]
+    final_text = "\n".join(final_text)
+    return final_text
+
+
 
 
 def full_file_gen(instance):
@@ -293,6 +322,7 @@ def ingest_files(filenames):
 PROMPT_FUNCTIONS = {
     "style-2": prompt_style_2,
     "style-3": prompt_style_3,
+    "style-4": prompt_style_4,
     "full_file_gen": full_file_gen,
     "style-2-edits-only": prompt_style_2_edits_only,
 }
@@ -334,12 +364,36 @@ def get_oracle_filenames(instance):
     return gold_docs
 
 
+def load_jsonl_file(filename):
+    if type(filename) == str:
+        filename = Path(filename)
+    if filename.name.endswith(".jsonl") or filename.name.endswith(".jsonl.all"):
+        with open(filename) as f:
+            return [json.loads(line) for line in f]
+    elif filename.name.endswith(".json"):
+        with open(filename) as f:
+            return json.load(f)
+    else:
+        raise ValueError(f"Unknown file type {filename}")
+    
+
+def find_documents_file(dataset_name, instance_id, document_encoding_style, base_dir):
+    dataset_name = dataset_name.replace("/", "__")
+    repo_path = Path(base_dir, dataset_name, document_encoding_style + "_indexes")
+    documents_file = Path(repo_path, instance_id, "documents.jsonl")
+    if not documents_file.exists():
+        raise FileNotFoundError(f"Documents file not found: {documents_file}")
+    return documents_file
+  
 def add_text_inputs(
-    input_instances,
+    dataset_name_or_path,
+    instances,
     retrieval_file,
-    k,
-    prompt_style,
-    file_source,
+    document_encoding_style,
+    base_dir,
+    k=None,
+    prompt_style=None,
+    file_source=None,
     max_context_len=None,
     tokenizer_name=None,
     verbose=False,
@@ -359,77 +413,68 @@ def add_text_inputs(
             tokenizer_name is not None
         ), "Must specify tokenizer_name if using max_context_len"
         tokenizer, tokenizer_func = TOKENIZER_FUNCS[tokenizer_name]
-    input_instances_copy = deepcopy(input_instances)
-    if file_source in {"bm25"}:
-        add_retrieval_results(input_instances_copy, retrieval_file, k, file_source)
+        
+    logger.info(f"Loading retrieval results from {retrieval_file}")
+    retrieval_results = load_jsonl_file(retrieval_file)
+    retrieval_map = {r["instance_id"]: r["hits"] for r in retrieval_results}
+    documents_cache = {}
     orig_dir = os.getcwd()
-    with TemporaryDirectory(
-        dir="/scratch" if os.path.exists("/scratch") else "/tmp"
-    ) as root_dir:
-        for instance_id, instance in tqdm(
-            input_instances_copy.items(),
-            total=len(input_instances_copy),
-            desc="Adding text inputs",
-        ):
-            try:
-                with AutoContextManager(
-                    instance, root_dir, verbose=verbose
-                ) as cm:
-                    readmes = cm.get_readme_files()
-                    instance["readmes"] = ingest_files(readmes)
-                    if max_context_len is not None:
-                        instance["file_contents"] = dict()
-                        base_text_inputs = PROMPT_FUNCTIONS[prompt_style](instance)
-                        base_text_input_length = len(
-                            tokenizer_func(base_text_inputs, tokenizer)
-                        )
-                    if file_source in {"oracle"}:
-                        instance["file_contents"] = ingest_files(
-                            get_oracle_filenames(instance)
-                        )
-                    elif file_source in {"bm25"}:
-                        instance["file_contents"] = ingest_files(
-                            [x["docid"] for x in instance["hits"]]
-                        )
-                    elif file_source in {"all"}:
-                        instance["file_contents"] = ingest_directory_contents(
-                            cm.repo_path
-                        )
-                    elif file_source in {"none"}:
-                        instance["file_contents"] = dict()
-                    else:
-                        raise ValueError(f"Invalid file source {file_source}")
-                    if max_context_len is not None:
-                        cur_input_len = base_text_input_length
-                        include_files = list()
-                        for filename in [x["docid"] for x in instance["hits"]]:
-                            content = make_code_text(
-                                {filename: instance["file_contents"][filename]}
-                            )
-                            if tokenizer_name in {"llama"}:
-                                tokens = tokenizer_func("\n" + content, tokenizer)
-                                idx = tokens.index(13)
-                                assert (
-                                    idx <= 2
-                                ), "Expected newline token id (13) to be one of the first three tokens"
-                                tokens = tokens[idx + 1 :]  # remove newline tokens
-                            else:
-                                tokens = tokenizer_func(content, tokenizer)
-                            if cur_input_len + len(tokens) < max_context_len:
-                                include_files.append(filename)
-                                cur_input_len += len(tokens)
-                        instance["file_contents"] = {
-                            filename: instance["file_contents"][filename]
-                            for filename in include_files
-                        }
-                    input_instances[instance_id]["text_inputs"] = PROMPT_FUNCTIONS[
-                        prompt_style
-                    ](instance)
-            except Exception as e:
-                print(f"Failed on instance {instance_id}", e)
-                traceback.print_exc()
-                input_instances[instance_id]["text_inputs"] = None
-            finally:
-                # if AutoContextManager fails to exit properly future exits will return the wrong directory
-                os.chdir(orig_dir)
+    for instance_id, instance in tqdm(instances.items(), desc="Adding text inputs"):
+        hits = retrieval_map.get(instance_id, [])
+        if not hits:
+            logger.warning(f"No hits found for {instance_id}")
+            instance["text_inputs"] = None
+            instance["retrieved_documents"] = []
+            continue
+
+        repo_name = instance_id.split("__")[0]
+        if repo_name not in documents_cache:
+            documents_file = find_documents_file(dataset_name_or_path, instance_id, document_encoding_style, base_dir)
+            documents_cache[repo_name] = {doc["id"]: doc for doc in load_jsonl_file(documents_file)}
+        documents = documents_cache[repo_name]
+
+        if max_context_len is not None:
+            instance["function_contents"] = dict()
+            base_text_inputs = PROMPT_FUNCTIONS[prompt_style](instance)
+            base_text_input_length = len(
+                tokenizer_func(base_text_inputs, tokenizer)
+            )
+
+        func_dict = dict()
+
+        if max_context_len is not None:
+            cur_input_len = base_text_input_length
+            include_files = list()
+        
+        if k is not None:
+            hits = hits[:k]
+        
+        for hit in hits:
+            docid = hit["docid"]
+            if docid not in documents:
+                logger.warning(f"Doc ID {docid} not found in documents.jsonl")
+                continue
+            function_data = documents[docid]["contents"]
+            func_dict[docid] = function_data
+
+        for function_id, function_content in func_dict.items():
+            if tokenizer_name in {"llama"}:
+                tokens = tokenizer_func("\n" + function_content, tokenizer)
+                idx = tokens.index(13)
+                assert (
+                    idx <= 2
+                ), "Expected newline token id (13) to be one of the first three tokens"
+                tokens = tokens[idx + 1 :] 
+            else:
+                tokens = tokenizer_func(function_content, tokenizer)
+            if cur_input_len + len(tokens) < max_context_len:
+                include_files.append(function_id)
+                cur_input_len += len(tokens)
+            instance["function_contents"] = {
+                function_id: function_content
+                for function_id in include_files
+            }
+        instances[instance_id]["text_inputs"] = PROMPT_FUNCTIONS[
+            prompt_style
+        ](instance)
     os.chdir(orig_dir)

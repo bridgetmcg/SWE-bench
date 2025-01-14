@@ -20,38 +20,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
-def load_jsonl_file(filename):
-    if type(filename) == str:
-        filename = Path(filename)
-    if filename.name.endswith(".jsonl") or filename.name.endswith(".jsonl.all"):
-        with open(filename) as f:
-            return [json.loads(line) for line in f]
-    elif filename.name.endswith(".json"):
-        with open(filename) as f:
-            return json.load(f)
-    else:
-        raise ValueError(f"Unknown file type {filename}")
-
-
-def instances_generator(files):
-    all_data = list()
-    for file in tqdm(files, desc="Loading instance files"):
-        all_data.extend(load_jsonl_file(file))
-    return all_data
-
-
-def get_training_and_eval_instances(raw_files, test_dataset):
-    logger.info("Loading instances")
-    raw_instances = list(instances_generator(raw_files))
-    final_instances = list(test_dataset["test"])
-    eval_repos = {x["repo"] for x in final_instances}
-    train_instances = [x for x in raw_instances if x["repo"] not in eval_repos]
-    train_instances = list(sorted(train_instances, key=lambda x: x["instance_id"]))
-    eval_instances = list(sorted(final_instances, key=lambda x: x["instance_id"]))
-    logger.info(f"Found {len(train_instances)} training ids")
-    logger.info(f"Found {len(eval_instances)} eval ids")
-    return train_instances, eval_instances
-
 
 def extract_fields(instance):
     instance_id = instance["instance_id"]
@@ -72,6 +40,8 @@ def main(
     validation_ratio,
     output_dir,
     retrieval_file,
+    document_encoding_style,
+    base_dir,
     prompt_style,
     file_source,
     k,
@@ -121,8 +91,11 @@ def main(
     for split in splits:
         split_instances[split] = {x["instance_id"]: x for x in dataset[split]}
         add_text_inputs(
+            dataset_name_or_path,
             split_instances[split],
             retrieval_file,
+            document_encoding_style,
+            base_dir,
             k,
             prompt_style,
             file_source,
@@ -201,6 +174,18 @@ if __name__ == "__main__":
         "--retrieval_file",
         type=str,
         help="Path to the file where the retrieval results are stored.",
+    )
+    parser.add_argument(
+        "--document_encoding_style",
+        type=str,
+        help="The document encoding style used to generate the documents.jsonl file.",
+        default="function_level_with_treesitter"
+    )
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        help="Base directory where documents.jsonl files are stored.",
+        default="./retrieval_results"
     )
     parser.add_argument(
         "--prompt_style",

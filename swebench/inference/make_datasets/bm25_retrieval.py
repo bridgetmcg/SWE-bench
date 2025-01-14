@@ -13,6 +13,8 @@ from git import Repo
 from pathlib import Path
 from tqdm.auto import tqdm
 from argparse import ArgumentParser
+from tree_sitter import Node, Parser, Language, Tree
+import tree_sitter_python as ts_python
 
 from swebench.inference.make_datasets.utils import list_files, string_to_bool
 
@@ -20,6 +22,15 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+function_query_py = """
+(
+  (function_definition
+    name: (identifier) @name
+    parameters: (parameters) @parameters
+    body: (block . (expression_statement . (string) @doc .)?) @body) @definition.function
+)
+"""
 
 
 class ContextManager:
@@ -70,6 +81,11 @@ class ContextManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
+def file_contents(filename, relative_path):
+    text = ""
+    with open(filename) as f:
+        text += f.read()
+    return text
 
 def file_name_and_contents(filename, relative_path):
     text = relative_path + "\n"
@@ -147,8 +163,8 @@ DOCUMENT_ENCODING_FUNCTIONS = {
     "file_name_and_contents": file_name_and_contents,
     "file_name_and_documentation": file_name_and_documentation,
     "file_name_and_docs_jedi": file_name_and_docs_jedi,
+    "function_level_with_treesitter": file_contents,
 }
-
 
 def clone_repo(repo, root_dir, token):
     """
@@ -170,8 +186,41 @@ def clone_repo(repo, root_dir, token):
         Repo.clone_from(repo_url, repo_dir)
     return repo_dir
 
+def query_tree(language: Language, tree: Tree, query: str):
+    q = language.query(query)
+    return q.captures(tree.root_node)
 
-def build_documents(repo_dir, commit, document_encoding_func):
+def node_to_string(src: bytes, node):
+    return src[node.start_byte:node.end_byte].decode("utf8")
+
+def parse_ex(text):
+    parser = Parser(Language(ts_python.language()))
+    buf = bytes(text, "utf8")
+    tree = parser.parse(buf)
+    res = []
+    captures = query_tree(Language(ts_python.language()),tree, function_query_py)
+    for node, ty in captures:
+        if ty != "definition.function":
+            continue
+        _, col = node.start_point
+        if col != 0:
+            continue
+        function_name = node.child_by_field_name("name").text.decode("utf8")
+        function_name_param = node.child_by_field_name("parameters").text.decode("utf8")
+        docstring = None
+        for child in node.children:
+            if child.type == 'block':  
+                for statement in child.children:
+                    if statement.type == 'expression_statement':
+                        for string in statement.children:
+                            if string.type == 'string':
+                                docstring  = string.text.decode('utf-8')  
+                                break
+        res.append((node_to_string(buf, node), function_name, function_name_param, docstring, node.start_point[0], node.end_point[0]))
+
+    return res
+
+def build_documents(repo_dir, commit, document_encoding_func, function_level=True):
     """
     Builds a dictionary of documents from a given repository directory and commit.
 
@@ -183,15 +232,28 @@ def build_documents(repo_dir, commit, document_encoding_func):
     Returns:
         dict: A dictionary where the keys are the relative paths of the documents and the values are the encoded document text.
     """
-    documents = dict()
+    documents = []
     with ContextManager(repo_dir, commit):
         filenames = list_files(repo_dir, include_tests=False)
         for relative_path in filenames:
             filename = os.path.join(repo_dir, relative_path)
             text = document_encoding_func(filename, relative_path)
-            documents[relative_path] = text
+            if(function_level):
+                for func, name, function_name_param, docstring, line_number_start, line_number_end in parse_ex(text):
+                    function_dict = {
+                        "contents": func,
+                        "relative_path": relative_path,
+                        "function_name": name,
+                        "function_name_param": function_name_param,
+                        "docstring": docstring,
+                        "line_number_start": line_number_start,
+                        "line_number_end": line_number_end,
+                        "id": f"{relative_path}::{name}"
+                    }
+                    documents.append(function_dict)
+            else:  
+                documents[relative_path] = text
     return documents
-
 
 def make_index(
     repo_dir,
@@ -203,7 +265,7 @@ def make_index(
     instance_id,
 ):
     """
-    Builds an index for a given set of documents using Pyserini.
+    Builds an index for function-level documents using Pyserini.
 
     Args:
         repo_dir (str): The path to the repository directory.
@@ -226,12 +288,9 @@ def make_index(
         documents_path.parent.mkdir(parents=True)
     documents = build_documents(repo_dir, commit, document_encoding_func)
     with open(documents_path, "w") as docfile:
-        for relative_path, contents in documents.items():
-            print(
-                json.dumps({"id": relative_path, "contents": contents}),
-                file=docfile,
-                flush=True,
-            )
+        for doc in documents:
+            print(json.dumps(doc), file=docfile, flush=True)
+
     cmd = [
         python,
         "-m",
@@ -318,17 +377,20 @@ def search(instance, index_path):
         dict: A dictionary containing the instance ID and a list of hits, where each hit is a dictionary containing the
         document ID and its score.
     """
+    #print(index_path)
     try:
         instance_id = instance["instance_id"]
         searcher = LuceneSearcher(index_path.as_posix())
         cutoff = len(instance["problem_statement"])
         while True:
             try:
+                #print(instance["problem_statement"][:cutoff])
                 hits = searcher.search(
                     instance["problem_statement"][:cutoff],
                     k=20,
                     remove_dups=True,
                 )
+                #print(hits)
             except Exception as e:
                 if "maxClauseCount" in str(e):
                     cutoff = int(round(cutoff * 0.8))
@@ -466,6 +528,7 @@ def main(
     num_shards,
     splits,
     leave_indexes,
+    limit=None
 ):
     document_encoding_func = DOCUMENT_ENCODING_FUNCTIONS[document_encoding_style]
     token = os.environ.get("GITHUB_TOKEN", "git")
@@ -483,6 +546,8 @@ def main(
         raise ValueError(f"Unknown splits {set(splits) - set(dataset.keys())}")
     for split in splits:
         instances += list(dataset[split])
+    if limit:  # Limit the number of instances
+        instances = instances[:limit]
     python = subprocess.run("which python", shell=True, capture_output=True)
     python = python.stdout.decode("utf-8").strip()
     output_file = Path(
@@ -534,9 +599,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--document_encoding_style",
         choices=DOCUMENT_ENCODING_FUNCTIONS.keys(),
-        default="file_name_and_contents",
+        default="function_level_with_treesitter",
     )
-    parser.add_argument("--output_dir", default="./retreival_results")
+    parser.add_argument("--output_dir", default="./retrieval_results")
     parser.add_argument("--splits", nargs="+", default=["train", "test"])
     parser.add_argument("--shard_id", type=int)
     parser.add_argument("--num_shards", type=int, default=20)
